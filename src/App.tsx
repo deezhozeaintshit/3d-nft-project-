@@ -9,7 +9,7 @@ import { NFT3DViewer } from './components/NFT3DViewer';
 import { walletService } from './web3/walletService';
 import { soundtrackEngine, type TrackMetadata } from './audio/soundtrackEngine';
 import { calculateRarity } from './utils/calculateRarity';
-import { Box, Eye, X } from 'lucide-react';
+import { Box, Eye, X, Upload, KeyRound, Save, Loader2 } from 'lucide-react';
 
 export default function App() {
   const viewerRef = useRef<ThreeViewerRef>(null);
@@ -72,6 +72,105 @@ export default function App() {
 
   // Toast feedback state
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // API Keys settings + GLB import state
+  const [isKeysModalOpen, setIsKeysModalOpen] = useState(false);
+  const [keysStatus, setKeysStatus] = useState<Record<string, { configured: boolean; masked: string }>>({});
+  const [keyInputs, setKeyInputs] = useState<Record<string, string>>({});
+  const [isSavingKeys, setIsSavingKeys] = useState(false);
+  const [isUploadingGlb, setIsUploadingGlb] = useState(false);
+  const glbInputRef = useRef<HTMLInputElement | null>(null);
+
+  const API_KEY_LABELS: Record<string, string> = {
+    TRIPO_API_KEY: 'Tripo 3D (text-to-3D)',
+    AGNES_API_KEY: 'Agnes AI (3D gateway)',
+    PINATA_API_KEY: 'Pinata API key (IPFS pinning)',
+    PINATA_SECRET_API_KEY: 'Pinata secret key (IPFS pinning)',
+    GEMINI_API_KEY: 'Gemini (music generation)',
+  };
+
+  const loadKeysStatus = async () => {
+    try {
+      const resp = await fetch('/api/settings/keys');
+      const data = await resp.json();
+      if (data?.keys) setKeysStatus(data.keys);
+    } catch { /* settings unavailable */ }
+  };
+
+  const openKeysModal = () => {
+    setKeyInputs({});
+    setIsKeysModalOpen(true);
+    loadKeysStatus();
+  };
+
+  const handleSaveKeys = async () => {
+    const payload: Record<string, string> = {};
+    for (const [k, v] of Object.entries(keyInputs)) {
+      if (v.trim() !== '') payload[k] = v.trim();
+    }
+    if (Object.keys(payload).length === 0) {
+      setToastMessage('Nothing to save — type a key first');
+      setTimeout(() => setToastMessage(null), 2500);
+      return;
+    }
+    setIsSavingKeys(true);
+    try {
+      const resp = await fetch('/api/settings/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (data?.success) {
+        setKeysStatus(data.keys || {});
+        setKeyInputs({});
+        setToastMessage(`Saved ${(data.updated || []).length} API key(s)`);
+      } else {
+        setToastMessage(`Key save failed: ${data?.error || 'unknown error'}`);
+      }
+    } catch (e: any) {
+      setToastMessage(`Key save failed: ${e.message}`);
+    } finally {
+      setIsSavingKeys(false);
+      setTimeout(() => setToastMessage(null), 3000);
+    }
+  };
+
+  const handleImportGlbFile = async (file: File | null) => {
+    if (!file) return;
+    if (!/\.glb$/i.test(file.name)) {
+      setToastMessage('Please choose a .glb file');
+      setTimeout(() => setToastMessage(null), 2500);
+      return;
+    }
+    setIsUploadingGlb(true);
+    setToastMessage('Uploading GLB...');
+    try {
+      const buf = await file.arrayBuffer();
+      const resp = await fetch('/api/upload-glb', {
+        method: 'POST',
+        headers: { 'Content-Type': 'model/gltf-binary' },
+        body: buf,
+      });
+      const data = await resp.json();
+      if (data?.success && data.url) {
+        setR3fModelUrl(data.url);
+        const base = file.name.replace(/\.glb$/i, '').replace(/[-_]+/g, ' ').slice(0, 48) || 'Imported';
+        setNftName(`${base} #${Math.floor(Math.random() * 900 + 100)}`);
+        setDescription(`Imported 3D model: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+        viewerRef.current?.resetCamera();
+        setToastMessage('GLB imported — ready to mint');
+      } else {
+        setToastMessage(`Import failed: ${data?.error || 'unknown error'}`);
+      }
+    } catch (e: any) {
+      setToastMessage(`Import failed: ${e.message}`);
+    } finally {
+      setIsUploadingGlb(false);
+      setTimeout(() => setToastMessage(null), 3500);
+      if (glbInputRef.current) glbInputRef.current.value = '';
+    }
+  };
 
   // Collection Gallery State
   const [isGalleryOpen, setIsGalleryOpen] = useState<boolean>(false);
@@ -756,6 +855,34 @@ export default function App() {
         isMinting={mintStep !== 'idle' && mintStep !== 'success' && mintStep !== 'error'}
       />
 
+      {/* 3.5 Floating quick actions: Import GLB + API Keys */}
+      <div className="absolute bottom-28 right-4 z-30 flex flex-col space-y-2">
+        <button
+          onClick={() => glbInputRef.current?.click()}
+          disabled={isUploadingGlb}
+          title="Import a .glb file (e.g. from Tripo Studio)"
+          className="flex items-center space-x-2 px-3 py-2 rounded-xl bg-purple-950/90 border border-purple-500/40 text-purple-200 text-xs font-mono hover:bg-purple-900/90 transition-colors disabled:opacity-60"
+        >
+          {isUploadingGlb ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+          <span>{isUploadingGlb ? 'Uploading...' : 'Import GLB'}</span>
+        </button>
+        <button
+          onClick={openKeysModal}
+          title="Manage API keys (Tripo, Agnes, Pinata, Gemini)"
+          className="flex items-center space-x-2 px-3 py-2 rounded-xl bg-neutral-900/90 border border-neutral-700 text-neutral-300 text-xs font-mono hover:bg-neutral-800/90 transition-colors"
+        >
+          <KeyRound className="w-4 h-4" />
+          <span>API Keys</span>
+        </button>
+        <input
+          ref={glbInputRef}
+          type="file"
+          accept=".glb"
+          className="hidden"
+          onChange={(e) => handleImportGlbFile(e.target.files?.[0] || null)}
+        />
+      </div>
+
       {/* 4. Minting & IPFS Modal */}
       <MintModal
         isOpen={isMintModalOpen}
@@ -798,6 +925,80 @@ export default function App() {
         isConnecting={isConnectingWallet}
         error={walletError}
       />
+
+      {/* 6.5 API Keys Settings Modal */}
+      {isKeysModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm select-none">
+          <div className="relative w-full max-w-xl rounded-2xl border border-neutral-800 bg-neutral-950 p-5 shadow-2xl flex flex-col text-neutral-100">
+            <div className="flex items-center justify-between pb-3 border-b border-neutral-800 mb-4">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 rounded-lg bg-amber-600/20 text-amber-400 border border-amber-500/30">
+                  <KeyRound className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">API Keys</h3>
+                  <p className="text-xs text-neutral-400">
+                    Stored on this machine only (data/keys.json, gitignored). Env vars still win as fallback.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsKeysModalOpen(false)}
+                className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-900 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 max-h-[55vh] overflow-y-auto pr-1">
+              {Object.keys(API_KEY_LABELS).map((name) => {
+                const st = keysStatus[name];
+                return (
+                  <div key={name} className="rounded-xl bg-neutral-900 border border-neutral-800 p-3">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-xs font-semibold text-neutral-200">{API_KEY_LABELS[name]}</span>
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
+                        st?.configured
+                          ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                          : 'bg-neutral-800 border-neutral-700 text-neutral-500'
+                      }`}>
+                        {st?.configured ? `set (${st.masked})` : 'not set'}
+                      </span>
+                    </div>
+                    <input
+                      type="password"
+                      value={keyInputs[name] || ''}
+                      onChange={(e) => setKeyInputs((prev) => ({ ...prev, [name]: e.target.value }))}
+                      placeholder={st?.configured ? 'Type a new key to replace...' : 'Paste key here...'}
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="w-full px-3 py-1.5 text-xs font-mono rounded-lg bg-neutral-950 border border-neutral-800 focus:border-amber-500 focus:outline-none text-neutral-200 placeholder-neutral-600"
+                    />
+                    <div className="text-[10px] font-mono text-neutral-600 mt-1">{name}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center justify-end space-x-2 pt-4 mt-2 border-t border-neutral-800">
+              <button
+                onClick={() => setIsKeysModalOpen(false)}
+                className="px-3 py-1.5 text-xs font-mono rounded-lg bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-neutral-300 transition-colors"
+              >
+                Close
+              </button>
+              <button
+                onClick={handleSaveKeys}
+                disabled={isSavingKeys}
+                className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-mono rounded-lg bg-amber-600/20 border border-amber-500/40 text-amber-300 hover:bg-amber-600/30 transition-colors disabled:opacity-60"
+              >
+                {isSavingKeys ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                <span>{isSavingKeys ? 'Saving...' : 'Save keys'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 7. Reusable @react-three/fiber & @react-three/drei NFT3DViewer Modal */}
       {isR3FViewerOpen && (

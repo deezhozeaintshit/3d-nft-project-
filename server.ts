@@ -2,10 +2,54 @@ import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
+
+// -------------------------------------------------------------
+// Runtime API key store (Settings UI)
+// Priority: in-memory overrides -> data/keys.json -> process.env
+// data/keys.json is gitignored and written with 0600 permissions.
+// Keys are never served in full — the settings endpoint only
+// returns masked previews (first 4 + last 4 chars).
+// -------------------------------------------------------------
+const MANAGED_API_KEYS = [
+  'TRIPO_API_KEY',
+  'AGNES_API_KEY',
+  'PINATA_API_KEY',
+  'PINATA_SECRET_API_KEY',
+  'GEMINI_API_KEY',
+] as const;
+const DATA_DIR = path.join(process.cwd(), 'data');
+const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const runtimeKeyOverrides = new Map<string, string>();
+
+function readKeysFile(): Record<string, string> {
+  try {
+    if (fs.existsSync(KEYS_FILE)) {
+      return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8') || '{}');
+    }
+  } catch { /* corrupted file -> treat as empty */ }
+  return {};
+}
+
+function getApiKey(name: string): string {
+  const override = runtimeKeyOverrides.get(name);
+  if (override && override.trim() !== '') return override.trim();
+  const fileKeys = readKeysFile();
+  if (fileKeys[name] && fileKeys[name].trim() !== '') return fileKeys[name].trim();
+  return (process.env[name] || '').trim();
+}
+
+function maskKey(value: string): string {
+  if (!value || value.trim() === '') return '';
+  const v = value.trim();
+  if (v.length <= 8) return '••••••••';
+  return `${v.slice(0, 4)}••••${v.slice(-4)}`;
+}
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -149,7 +193,7 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
     // 2b. Tripo AI Text-to-3D (REAL AI generation) — attempted before any fallback.
     // Submits an async job and returns immediately; the client polls
     // GET /api/generate-3d/status?taskId=... until the GLB is ready.
-    const tripoApiKey = process.env.TRIPO_API_KEY;
+    const tripoApiKey = getApiKey('TRIPO_API_KEY');
     if (tripoApiKey && tripoApiKey.trim() !== '') {
       try {
         console.log(`[Tripo] Submitting text-to-3D task for prompt: "${prompt}" [seed: ${validatedSeed}]`);
@@ -185,7 +229,7 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
       }
     }
 
-    const agnesApiKey = process.env.AGNES_API_KEY;
+    const agnesApiKey = getApiKey('AGNES_API_KEY');
     let agnesDiagnostic: {
       attempted: boolean;
       status?: number;
@@ -476,7 +520,7 @@ app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
       return res.status(404).json({ status: 'failed', error: 'Unknown or expired generation task' });
     }
 
-    const tripoApiKey = (process.env.TRIPO_API_KEY || '').trim();
+    const tripoApiKey = getApiKey('TRIPO_API_KEY');
     if (!tripoApiKey) {
       return res.status(500).json({ status: 'failed', error: 'TRIPO_API_KEY is not configured' });
     }
@@ -523,6 +567,101 @@ app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
     return res.status(500).json({ status: 'failed', error: err.message || 'Status poll failed' });
   }
 });
+
+// -------------------------------------------------------------
+// API ROUTE: GET /api/settings/keys
+// Returns masked status for each managed API key (never the full value).
+// -------------------------------------------------------------
+app.get('/api/settings/keys', (_req: Request, res: Response) => {
+  const keys: Record<string, { configured: boolean; masked: string }> = {};
+  for (const name of MANAGED_API_KEYS) {
+    const v = getApiKey(name);
+    keys[name] = { configured: v !== '', masked: maskKey(v) };
+  }
+  res.json({ success: true, keys });
+});
+
+// -------------------------------------------------------------
+// API ROUTE: POST /api/settings/keys
+// Body: { TRIPO_API_KEY?: string, AGNES_API_KEY?: string, ... }
+// Empty string clears a stored key (falls back to env). Persisted to
+// data/keys.json (gitignored, 0600). Never logs values.
+// -------------------------------------------------------------
+app.post('/api/settings/keys', (req: Request, res: Response) => {
+  try {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const stored = readKeysFile();
+    const updated: string[] = [];
+    for (const name of MANAGED_API_KEYS) {
+      if (!(name in body)) continue;
+      const v = typeof body[name] === 'string' ? (body[name] as string).trim() : '';
+      if (v === '') {
+        delete stored[name];
+        runtimeKeyOverrides.delete(name);
+      } else {
+        stored[name] = v;
+        runtimeKeyOverrides.set(name, v);
+      }
+      updated.push(name);
+    }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(KEYS_FILE, JSON.stringify(stored, null, 2), { mode: 0o600 });
+    const keys: Record<string, { configured: boolean; masked: string }> = {};
+    for (const name of MANAGED_API_KEYS) {
+      const v = getApiKey(name);
+      keys[name] = { configured: v !== '', masked: maskKey(v) };
+    }
+    res.json({ success: true, updated, keys });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Failed to save keys' });
+  }
+});
+
+// -------------------------------------------------------------
+// API ROUTE: POST /api/upload-glb
+// Accepts a raw .glb binary body (Content-Type: model/gltf-binary),
+// stores it under data/uploads, and returns a local URL the viewer
+// and minting flow can use. 50MB cap. GLB magic bytes validated.
+// -------------------------------------------------------------
+app.post(
+  '/api/upload-glb',
+  express.raw({ type: 'model/gltf-binary', limit: '50mb' }),
+  (req: Request, res: Response) => {
+    try {
+      const buf = req.body as Buffer;
+      if (!buf || !Buffer.isBuffer(buf) || buf.length < 12) {
+        return res.status(400).json({ success: false, error: 'No GLB data received' });
+      }
+      if (buf.readUInt32LE(0) !== 0x46546c67) {
+        return res.status(400).json({ success: false, error: 'Not a valid GLB file (bad magic bytes)' });
+      }
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+      const filename = `${id}.glb`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), buf);
+      const url = `/api/uploads/${filename}`;
+      console.log(`[Upload] GLB stored: ${filename} (${(buf.length / 1024 / 1024).toFixed(2)} MB)`);
+      res.json({ success: true, url, filename, sizeBytes: buf.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message || 'Upload failed' });
+    }
+  }
+);
+
+// Serve uploaded GLBs
+app.get('/api/uploads/:filename', (req: Request, res: Response) => {
+  const filename = path.basename(req.params.filename || '');
+  if (!/^[-a-z0-9]+\.glb$/i.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+  const full = path.join(UPLOADS_DIR, filename);
+  if (!fs.existsSync(full)) {
+    return res.status(404).json({ error: 'Upload not found' });
+  }
+  res.setHeader('Content-Type', 'model/gltf-binary');
+  res.sendFile(full);
+});
+
 /**
  * Procedural binary GLTF/GLB builder for server-side 3D asset serving
  */
@@ -644,8 +783,8 @@ app.post('/api/pin-metadata', async (req: Request, res: Response) => {
     const finalModelUrl = animation_url || modelUrl || 'ipfs://bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xednzrqoj3dwfe8528956/model.glb';
 
     const pinataJwt = process.env.PINATA_JWT;
-    const pinataApiKey = process.env.PINATA_API_KEY;
-    const pinataSecretKey = process.env.PINATA_SECRET_API_KEY;
+    const pinataApiKey = getApiKey('PINATA_API_KEY');
+    const pinataSecretKey = getApiKey('PINATA_SECRET_API_KEY');
     const pinataGateway = process.env.PINATA_GATEWAY || 'gateway.pinata.cloud';
 
     // Build standard ERC-721 compliant metadata object
@@ -772,7 +911,7 @@ app.post('/api/generate-music', async (req: Request, res: Response) => {
   try {
     const { prompt = 'ambient sci-fi cyberpunk synthwave', duration = 15, style = 'cyberpunk' } = req.body;
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = getApiKey('GEMINI_API_KEY');
     let geminiDescription = '';
 
     if (apiKey) {
