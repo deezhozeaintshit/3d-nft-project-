@@ -27,38 +27,42 @@ function generateDeterministicCID(content: string): string {
 }
 
 // -------------------------------------------------------------
-// Meshy AI Text-to-3D integration (real AI generation)
-// Verified against the official OpenAPI spec (https://docs.meshy.ai/openapi.yaml):
-//   Base URL: https://api.meshy.ai/openapi
-//   Auth: Authorization: Bearer <redacted>  (key from https://www.meshy.ai/settings/api, form msy_*)
-//   Submit: POST /v2/text-to-3d {mode:'preview'|'refine', prompt, ...} -> 202 {"result":"<taskId>"}
-//   Poll:   GET  /v2/text-to-3d/{id} -> {status: PENDING|IN_PROGRESS|SUCCEEDED|FAILED|CANCELED,
-//                                        progress, model_urls: {glb, ...}, thumbnail_url, task_error}
-// Free tier: 100 credits/mo, no card. Enable with MESHY_API_KEY env var.
+// Tripo AI Text-to-3D integration (real AI generation)
+// Verified against the official V3 spec (https://developers.tripo3d.ai):
+//   Base URL: https://openapi.tripo3d.ai
+//   Auth: Authorization: Bearer <key>  (key from the Tripo dashboard, free tier 300 credits/mo)
+//   Submit: POST /v3/generation/text-to-model {prompt, negative_prompt, model:'P1-20260311',
+//           model_seed, face_limit:20000, texture:true, pbr:true, texture_quality:'standard'}
+//           -> 200 {"task_id":"task_..."}
+//   Poll:   GET  /v3/tasks/{task_id} -> {status: queued|running|success|failed|cancelled,
+//                                        progress, output:{model_url, rendered_image_url},
+//                                        credits_consumed, error_message}
+// Single task returns a textured + PBR model — no preview/refine chain needed.
+// Enable with TRIPO_API_KEY env var.
 // -------------------------------------------------------------
-const MESHY_API_BASE = 'https://api.meshy.ai/openapi';
-const MESHY_REQUEST_TIMEOUT_MS = 30000;
+const TRIPO_API_BASE = 'https://openapi.tripo3d.ai';
+const TRIPO_REQUEST_TIMEOUT_MS = 30000;
+const TRIPO_MODEL = 'P1-20260311';
 
-interface MeshyJob {
-  meshyTaskId: string;
-  phase: 'preview' | 'refine';
+interface TripoJob {
+  tripoTaskId: string;
   prompt: string;
   seed: number;
   stylePreset: string;
   createdAt: number;
 }
 // In-memory job registry (single instance; entries expire after 2h)
-const meshyJobs = new Map<string, MeshyJob>();
+const tripoJobs = new Map<string, TripoJob>();
 
 function makeLocalTaskId(): string {
-  return `meshy-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  return `tripo-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
-async function meshyFetch(path: string, init: RequestInit, apiKey: string): Promise<globalThis.Response> {
+async function tripoFetch(path: string, init: RequestInit, apiKey: string): Promise<globalThis.Response> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), MESHY_REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), TRIPO_REQUEST_TIMEOUT_MS);
   try {
-    return await fetch(`${MESHY_API_BASE}${path}`, {
+    return await fetch(`${TRIPO_API_BASE}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -72,42 +76,41 @@ async function meshyFetch(path: string, init: RequestInit, apiKey: string): Prom
   }
 }
 
-async function submitMeshyPreview(
+async function submitTripoTask(
   prompt: string,
   seed: number,
   stylePreset: string,
   apiKey: string
 ): Promise<string | null> {
-  const enrichedPrompt = `${prompt}, ${stylePreset} style 3D game asset, centered composition`.slice(0, 800);
-  const res = await meshyFetch(
-    '/v2/text-to-3d',
+  const enrichedPrompt = `${prompt}, ${stylePreset} style 3D game asset, centered composition`.slice(0, 1024);
+  const res = await tripoFetch(
+    '/v3/generation/text-to-model',
     {
       method: 'POST',
       body: JSON.stringify({
-        mode: 'preview',
         prompt: enrichedPrompt,
         negative_prompt: 'low quality, blurry, watermark, text, logo',
-        art_style: 'realistic',
-        ai_model: 'latest',
-        seed,
-        target_polycount: 30000,
-        topology: 'triangle',
-        moderation: true,
+        model: TRIPO_MODEL,
+        model_seed: seed,
+        face_limit: 20000,
+        texture: true,
+        pbr: true,
+        texture_quality: 'standard',
       }),
     },
     apiKey
   );
-  if (res.status !== 202) {
+  if (!res.ok) {
     const body = await res.text().catch(() => '');
-    console.warn(`[Meshy] Preview submit failed [HTTP ${res.status}]:`, body.slice(0, 500));
+    console.warn(`[Tripo] Task submit failed [HTTP ${res.status}]:`, body.slice(0, 500));
     return null;
   }
   const data: any = await res.json().catch(() => null);
-  return data?.result || null;
+  return data?.task_id || null;
 }
 
-async function getMeshyTask(taskId: string, apiKey: string): Promise<any | null> {
-  const res = await meshyFetch(`/v2/text-to-3d/${encodeURIComponent(taskId)}`, { method: 'GET' }, apiKey);
+async function getTripoTask(taskId: string, apiKey: string): Promise<any | null> {
+  const res = await tripoFetch(`/v3/tasks/${encodeURIComponent(taskId)}`, { method: 'GET' }, apiKey);
   if (!res.ok) return null;
   return res.json().catch(() => null);
 }
@@ -143,24 +146,23 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
       ? (rawPreset as AllowedStylePreset)
       : 'cyberpunk';
 
-    // 2b. Meshy AI Text-to-3D (REAL AI generation) — attempted before any fallback.
+    // 2b. Tripo AI Text-to-3D (REAL AI generation) — attempted before any fallback.
     // Submits an async job and returns immediately; the client polls
     // GET /api/generate-3d/status?taskId=... until the GLB is ready.
-    const meshyApiKey = process.env.MESHY_API_KEY;
-    if (meshyApiKey && meshyApiKey.trim() !== '') {
+    const tripoApiKey = process.env.TRIPO_API_KEY;
+    if (tripoApiKey && tripoApiKey.trim() !== '') {
       try {
-        console.log(`[Meshy] Submitting text-to-3D task for prompt: "${prompt}" [seed: ${validatedSeed}]`);
-        const meshyTaskId = await submitMeshyPreview(
+        console.log(`[Tripo] Submitting text-to-3D task for prompt: "${prompt}" [seed: ${validatedSeed}]`);
+        const tripoTaskId = await submitTripoTask(
           prompt,
           validatedSeed,
           validatedStylePreset,
-          meshyApiKey.trim()
+          tripoApiKey.trim()
         );
-        if (meshyTaskId) {
+        if (tripoTaskId) {
           const localTaskId = makeLocalTaskId();
-          meshyJobs.set(localTaskId, {
-            meshyTaskId,
-            phase: 'preview',
+          tripoJobs.set(localTaskId, {
+            tripoTaskId,
             prompt,
             seed: validatedSeed,
             stylePreset: validatedStylePreset,
@@ -168,19 +170,18 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
           });
           return res.json({
             success: true,
-            provider: 'meshy',
+            provider: 'tripo',
             taskId: localTaskId,
             status: 'processing',
-            phase: 'preview',
             progress: 0,
             prompt,
             stylePreset: validatedStylePreset,
             seed: validatedSeed,
           });
         }
-        console.warn('[Meshy] Submit failed, falling back to procedural pipeline.');
-      } catch (meshyErr: any) {
-        console.warn('[Meshy] Submit exception, falling back to procedural pipeline:', meshyErr.message);
+        console.warn('[Tripo] Submit failed, falling back to procedural pipeline.');
+      } catch (tripoErr: any) {
+        console.warn('[Tripo] Submit exception, falling back to procedural pipeline:', tripoErr.message);
       }
     }
 
@@ -457,7 +458,7 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
 
 // -------------------------------------------------------------
 // API ROUTE: GET /api/generate-3d/status?taskId=...
-// Polls a Meshy text-to-3D job through preview -> refine (texture)
+// Polls a Tripo text-to-3D job (single textured+PBR task)
 // and returns the finished GLB URL when ready.
 // -------------------------------------------------------------
 app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
@@ -466,93 +467,62 @@ app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
 
     // Prune jobs older than 2h
     const now = Date.now();
-    for (const [k, v] of meshyJobs) {
-      if (now - v.createdAt > 2 * 60 * 60 * 1000) meshyJobs.delete(k);
+    for (const [k, v] of tripoJobs) {
+      if (now - v.createdAt > 2 * 60 * 60 * 1000) tripoJobs.delete(k);
     }
 
-    const job = meshyJobs.get(taskId);
+    const job = tripoJobs.get(taskId);
     if (!job) {
       return res.status(404).json({ status: 'failed', error: 'Unknown or expired generation task' });
     }
 
-    const meshyApiKey = (process.env.MESHY_API_KEY || '').trim();
-    if (!meshyApiKey) {
-      return res.status(500).json({ status: 'failed', error: 'MESHY_API_KEY is not configured' });
+    const tripoApiKey = (process.env.TRIPO_API_KEY || '').trim();
+    if (!tripoApiKey) {
+      return res.status(500).json({ status: 'failed', error: 'TRIPO_API_KEY is not configured' });
     }
 
-    const task = await getMeshyTask(job.meshyTaskId, meshyApiKey);
+    const task = await getTripoTask(job.tripoTaskId, tripoApiKey);
     if (!task) {
-      return res.json({ status: 'processing', phase: job.phase, progress: 0, taskId });
+      return res.json({ status: 'processing', progress: 0, taskId });
     }
 
     const status = task.status as string;
     const progress = typeof task.progress === 'number' ? task.progress : 0;
 
-    if (status === 'SUCCEEDED') {
-      if (job.phase === 'preview') {
-        // Chain the refine phase so the model comes back with PBR textures
-        try {
-          const refineRes = await meshyFetch(
-            '/v2/text-to-3d',
-            {
-              method: 'POST',
-              body: JSON.stringify({
-                mode: 'refine',
-                preview_task_id: job.meshyTaskId,
-                texture_prompt: `${job.prompt}, ${job.stylePreset} style, PBR game asset textures`,
-              }),
-            },
-            meshyApiKey
-          );
-          if (refineRes.status === 202) {
-            const refineData: any = await refineRes.json().catch(() => null);
-            if (refineData?.result) {
-              job.meshyTaskId = refineData.result;
-              job.phase = 'refine';
-              console.log(`[Meshy] Preview SUCCEEDED, refine task submitted: ${refineData.result}`);
-              return res.json({ status: 'processing', phase: 'refine', progress: 55, taskId });
-            }
-          }
-          console.warn('[Meshy] Refine submit failed — returning untextured preview GLB.');
-        } catch (e: any) {
-          console.warn('[Meshy] Refine submit exception — returning untextured preview GLB:', e.message);
-        }
-      }
-
-      const glbUrl = task.model_urls?.glb || null;
+    if (status === 'success') {
+      const glbUrl = task.output?.model_url || null;
       if (!glbUrl) {
-        return res.status(502).json({ status: 'failed', error: 'Meshy task succeeded but returned no GLB URL' });
+        return res.status(502).json({ status: 'failed', error: 'Tripo task succeeded but returned no model URL' });
       }
-      meshyJobs.delete(taskId);
+      tripoJobs.delete(taskId);
       return res.json({
         status: 'completed',
-        provider: 'meshy',
+        provider: 'tripo',
         taskId,
         modelUrl: glbUrl,
-        thumbnailUrl: task.thumbnail_url || null,
+        thumbnailUrl: task.output?.rendered_image_url || null,
         progress: 100,
         prompt: job.prompt,
         stylePreset: job.stylePreset,
         seed: job.seed,
-        textured: job.phase === 'refine',
-        creditsUsed: task.consumed_credits ?? null,
+        textured: true,
+        creditsUsed: task.credits_consumed ?? null,
       });
     }
 
-    if (status === 'FAILED' || status === 'CANCELED') {
-      meshyJobs.delete(taskId);
-      const msg = task.task_error?.message || `Meshy task ${status.toLowerCase()}`;
-      console.warn('[Meshy] Task failed:', msg);
+    if (status === 'failed' || status === 'cancelled') {
+      tripoJobs.delete(taskId);
+      const msg = task.error_message || `Tripo task ${status}`;
+      console.warn('[Tripo] Task failed:', msg);
       return res.json({ status: 'failed', taskId, error: msg });
     }
 
-    return res.json({ status: 'processing', phase: job.phase, progress, taskId });
+    return res.json({ status: 'processing', progress, taskId });
   } catch (err: any) {
-    console.error('[Meshy] Status poll error:', err.message);
+    console.error('[Tripo] Status poll error:', err.message);
     return res.status(500).json({ status: 'failed', error: err.message || 'Status poll failed' });
   }
 });
-
 /**
  * Procedural binary GLTF/GLB builder for server-side 3D asset serving
  */

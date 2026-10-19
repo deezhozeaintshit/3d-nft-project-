@@ -238,11 +238,11 @@ export default function App() {
     }
   };
 
-  // Poll a Meshy text-to-3D job until the GLB is ready (returns true) or it fails (false)
-  const pollMeshyGeneration = async (taskId: string, candidateSeed: number): Promise<boolean> => {
+  // Poll a Tripo text-to-3D job until the GLB is ready (returns true) or it fails (false)
+  const pollTripoGeneration = async (taskId: string, candidateSeed: number): Promise<boolean> => {
     const startedAt = Date.now();
     const MAX_WAIT_MS = 10 * 60 * 1000; // 10 minutes max
-    setToastMessage('Meshy AI is sculpting your model... (0%)');
+    setToastMessage('Tripo AI is sculpting your model... (0%)');
     while (Date.now() - startedAt < MAX_WAIT_MS) {
       await new Promise((r) => setTimeout(r, 5000));
       let s: any = null;
@@ -250,7 +250,7 @@ export default function App() {
         const resp = await fetch(`/api/generate-3d/status?taskId=${encodeURIComponent(taskId)}`);
         s = await resp.json();
       } catch (e: any) {
-        console.warn('[Meshy] status poll network error:', e.message);
+        console.warn('[Tripo] status poll network error:', e.message);
         continue;
       }
       if (!s) continue;
@@ -260,25 +260,24 @@ export default function App() {
         if (s.thumbnailUrl) setPreviewImage(s.thumbnailUrl);
         const quality = s.textured ? 'textured' : 'preview';
         setNftName(`${(s.stylePreset || stylePreset).toUpperCase()} AI Artifact #${(candidateSeed % 900) + 100}`);
-        setDescription(`AI-generated 3D model synthesized from prompt: "${prompt}" (Meshy AI, ${quality} quality)`);
+        setDescription(`AI-generated 3D model synthesized from prompt: "${prompt}" (Tripo AI, ${quality} quality)`);
         setPolyCount(30000);
-        setToastMessage(`Meshy AI model ready — ${quality} GLB loaded`);
+        setToastMessage(`Tripo AI model ready — ${quality} GLB loaded`);
         setTimeout(() => setToastMessage(null), 4000);
         return true;
       }
       if (s.status === 'failed') {
-        console.warn('[Meshy] generation failed:', s.error);
+        console.warn('[Tripo] generation failed:', s.error);
         return false;
       }
       const pct = typeof s.progress === 'number' ? s.progress : 0;
-      const phase = s.phase === 'refine' ? 'texturing' : 'sculpting';
-      setToastMessage(`Meshy AI is ${phase} your model... (${pct}%)`);
+      setToastMessage(`Tripo AI is sculpting your model... (${pct}%)`);
     }
-    console.warn('[Meshy] poll timed out after 10 minutes');
+    console.warn('[Tripo] poll timed out after 10 minutes');
     return false;
   };
 
-  // Client-side procedural fallback (used when the backend is unreachable or Meshy fails)
+  // Client-side procedural fallback (used when the backend is unreachable or Tripo fails)
   const runClientProceduralFallback = (candidateSeed: number) => {
     // High-grade client-side procedural fallback
     console.log('[3D Generation] Synthesizing procedural 3D model client-side for seed:', candidateSeed);
@@ -409,11 +408,11 @@ export default function App() {
 
       // If backend data was returned successfully, apply verified backend specs
       if (data && data.success) {
-        // --- Real AI path: Meshy async text-to-3D job, poll until the GLB is ready ---
-        if (data.provider === 'meshy' && data.taskId && data.status === 'processing') {
-          const meshyOk = await pollMeshyGeneration(data.taskId, candidateSeed);
-          if (!meshyOk) {
-            setToastMessage('Meshy AI generation failed — procedural fallback engaged');
+        // --- Real AI path: Tripo async text-to-3D job, poll until the GLB is ready ---
+        if (data.provider === 'tripo' && data.taskId && data.status === 'processing') {
+          const tripoOk = await pollTripoGeneration(data.taskId, candidateSeed);
+          if (!tripoOk) {
+            setToastMessage('Tripo AI generation failed — procedural fallback engaged');
             setTimeout(() => setToastMessage(null), 3500);
             runClientProceduralFallback(candidateSeed);
           }
@@ -457,7 +456,7 @@ export default function App() {
           setToastMessage(`✨ Synthesized: ${generatedName} (${count.toLocaleString()} Polys)`);
           setTimeout(() => setToastMessage(null), 4000);
         }
-        } // end non-Meshy backend path
+        } // end non-Tripo backend path
       } else {
         // High-grade client-side procedural fallback
         runClientProceduralFallback(candidateSeed);
