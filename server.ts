@@ -2,10 +2,58 @@ import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
+
+// -------------------------------------------------------------
+// Runtime API key store (Settings UI)
+// Priority: in-memory overrides -> data/keys.json -> process.env
+// data/keys.json is gitignored and written with 0600 permissions.
+// Keys are never served in full — the settings endpoint only
+// returns masked previews (first 4 + last 4 chars).
+// -------------------------------------------------------------
+const MANAGED_API_KEYS = [
+  'TRIPO_API_KEY',
+  'AGNES_API_KEY',
+  'PINATA_API_KEY',
+  'PINATA_SECRET_API_KEY',
+  'GEMINI_API_KEY',
+] as const;
+const DATA_DIR = path.join(process.cwd(), 'data');
+const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const runtimeKeyOverrides = new Map<string, string>();
+
+function readKeysFile(): Record<string, string> {
+  try {
+    if (fs.existsSync(KEYS_FILE)) {
+      return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8') || '{}');
+    }
+  } catch { /* corrupted file -> treat as empty */ }
+  return {};
+}
+
+function getApiKey(name: string): string {
+  const override = runtimeKeyOverrides.get(name);
+  if (override && override.trim() !== '') return override.trim();
+  const fileKeys = readKeysFile();
+  if (fileKeys[name] && fileKeys[name].trim() !== '') return fileKeys[name].trim();
+  return (process.env[name] || '').trim();
+}
+
+function maskKey(value: string): string {
+  if (!value || value.trim() === '') return '';
+  const v = value.trim();
+  if (v.length <= 8) return '••••••••';
+  return `${v.slice(0, 4)}••••${v.slice(-4)}`;
+}
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -24,6 +72,95 @@ const ipfsRegistry = new Map<string, any>();
 function generateDeterministicCID(content: string): string {
   const hash = crypto.createHash('sha256').update(content).digest('hex');
   return `bafybeic${hash.slice(0, 48)}`;
+}
+
+// -------------------------------------------------------------
+// Tripo AI Text-to-3D integration (real AI generation)
+// Verified against the official V3 spec (https://developers.tripo3d.ai):
+//   Base URL: https://openapi.tripo3d.ai
+//   Auth: Authorization: Bearer <key>  (key from the Tripo dashboard, free tier 300 credits/mo)
+//   Submit: POST /v3/generation/text-to-model {prompt, negative_prompt, model:'P1-20260311',
+//           model_seed, face_limit:20000, texture:true, pbr:true, texture_quality:'standard'}
+//           -> 200 {"task_id":"task_..."}
+//   Poll:   GET  /v3/tasks/{task_id} -> {status: queued|running|success|failed|cancelled,
+//                                        progress, output:{model_url, rendered_image_url},
+//                                        credits_consumed, error_message}
+// Single task returns a textured + PBR model — no preview/refine chain needed.
+// Enable with TRIPO_API_KEY env var.
+// -------------------------------------------------------------
+const TRIPO_API_BASE = 'https://openapi.tripo3d.ai';
+const TRIPO_REQUEST_TIMEOUT_MS = 30000;
+const TRIPO_MODEL = 'P1-20260311';
+
+interface TripoJob {
+  tripoTaskId: string;
+  prompt: string;
+  seed: number;
+  stylePreset: string;
+  createdAt: number;
+}
+// In-memory job registry (single instance; entries expire after 2h)
+const tripoJobs = new Map<string, TripoJob>();
+
+function makeLocalTaskId(): string {
+  return `tripo-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
+async function tripoFetch(path: string, init: RequestInit, apiKey: string): Promise<globalThis.Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TRIPO_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(`${TRIPO_API_BASE}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function submitTripoTask(
+  prompt: string,
+  seed: number,
+  stylePreset: string,
+  apiKey: string
+): Promise<string | null> {
+  const enrichedPrompt = `${prompt}, ${stylePreset} style 3D game asset, centered composition`.slice(0, 1024);
+  const res = await tripoFetch(
+    '/v3/generation/text-to-model',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        prompt: enrichedPrompt,
+        negative_prompt: 'low quality, blurry, watermark, text, logo',
+        model: TRIPO_MODEL,
+        model_seed: seed,
+        face_limit: 20000,
+        texture: true,
+        pbr: true,
+        texture_quality: 'standard',
+      }),
+    },
+    apiKey
+  );
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    console.warn(`[Tripo] Task submit failed [HTTP ${res.status}]:`, body.slice(0, 500));
+    return null;
+  }
+  const data: any = await res.json().catch(() => null);
+  return data?.task_id || null;
+}
+
+async function getTripoTask(taskId: string, apiKey: string): Promise<any | null> {
+  const res = await tripoFetch(`/v3/tasks/${encodeURIComponent(taskId)}`, { method: 'GET' }, apiKey);
+  if (!res.ok) return null;
+  return res.json().catch(() => null);
 }
 
 // -------------------------------------------------------------
@@ -57,7 +194,46 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
       ? (rawPreset as AllowedStylePreset)
       : 'cyberpunk';
 
-    const agnesApiKey = process.env.AGNES_API_KEY;
+    // 2b. Tripo AI Text-to-3D (REAL AI generation) — attempted before any fallback.
+    // Submits an async job and returns immediately; the client polls
+    // GET /api/generate-3d/status?taskId=... until the GLB is ready.
+    const tripoApiKey = getApiKey('TRIPO_API_KEY');
+    if (tripoApiKey && tripoApiKey.trim() !== '') {
+      try {
+        console.log(`[Tripo] Submitting text-to-3D task for prompt: "${prompt}" [seed: ${validatedSeed}]`);
+        const tripoTaskId = await submitTripoTask(
+          prompt,
+          validatedSeed,
+          validatedStylePreset,
+          tripoApiKey.trim()
+        );
+        if (tripoTaskId) {
+          const localTaskId = makeLocalTaskId();
+          tripoJobs.set(localTaskId, {
+            tripoTaskId,
+            prompt,
+            seed: validatedSeed,
+            stylePreset: validatedStylePreset,
+            createdAt: Date.now(),
+          });
+          return res.json({
+            success: true,
+            provider: 'tripo',
+            taskId: localTaskId,
+            status: 'processing',
+            progress: 0,
+            prompt,
+            stylePreset: validatedStylePreset,
+            seed: validatedSeed,
+          });
+        }
+        console.warn('[Tripo] Submit failed, falling back to procedural pipeline.');
+      } catch (tripoErr: any) {
+        console.warn('[Tripo] Submit exception, falling back to procedural pipeline:', tripoErr.message);
+      }
+    }
+
+    const agnesApiKey = getApiKey('AGNES_API_KEY');
     let agnesDiagnostic: {
       attempted: boolean;
       status?: number;
@@ -328,6 +504,168 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
   }
 });
 
+// -------------------------------------------------------------
+// API ROUTE: GET /api/generate-3d/status?taskId=...
+// Polls a Tripo text-to-3D job (single textured+PBR task)
+// and returns the finished GLB URL when ready.
+// -------------------------------------------------------------
+app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
+  try {
+    const taskId = (req.query.taskId || '').toString();
+
+    // Prune jobs older than 2h
+    const now = Date.now();
+    for (const [k, v] of tripoJobs) {
+      if (now - v.createdAt > 2 * 60 * 60 * 1000) tripoJobs.delete(k);
+    }
+
+    const job = tripoJobs.get(taskId);
+    if (!job) {
+      return res.status(404).json({ status: 'failed', error: 'Unknown or expired generation task' });
+    }
+
+    const tripoApiKey = getApiKey('TRIPO_API_KEY');
+    if (!tripoApiKey) {
+      return res.status(500).json({ status: 'failed', error: 'TRIPO_API_KEY is not configured' });
+    }
+
+    const task = await getTripoTask(job.tripoTaskId, tripoApiKey);
+    if (!task) {
+      return res.json({ status: 'processing', progress: 0, taskId });
+    }
+
+    const status = task.status as string;
+    const progress = typeof task.progress === 'number' ? task.progress : 0;
+
+    if (status === 'success') {
+      const glbUrl = task.output?.model_url || null;
+      if (!glbUrl) {
+        return res.status(502).json({ status: 'failed', error: 'Tripo task succeeded but returned no model URL' });
+      }
+      tripoJobs.delete(taskId);
+      return res.json({
+        status: 'completed',
+        provider: 'tripo',
+        taskId,
+        modelUrl: glbUrl,
+        thumbnailUrl: task.output?.rendered_image_url || null,
+        progress: 100,
+        prompt: job.prompt,
+        stylePreset: job.stylePreset,
+        seed: job.seed,
+        textured: true,
+        creditsUsed: task.credits_consumed ?? null,
+      });
+    }
+
+    if (status === 'failed' || status === 'cancelled') {
+      tripoJobs.delete(taskId);
+      const msg = task.error_message || `Tripo task ${status}`;
+      console.warn('[Tripo] Task failed:', msg);
+      return res.json({ status: 'failed', taskId, error: msg });
+    }
+
+    return res.json({ status: 'processing', progress, taskId });
+  } catch (err: any) {
+    console.error('[Tripo] Status poll error:', err.message);
+    return res.status(500).json({ status: 'failed', error: err.message || 'Status poll failed' });
+  }
+});
+
+// -------------------------------------------------------------
+// API ROUTE: GET /api/settings/keys
+// Returns masked status for each managed API key (never the full value).
+// -------------------------------------------------------------
+app.get('/api/settings/keys', (_req: Request, res: Response) => {
+  const keys: Record<string, { configured: boolean; masked: string }> = {};
+  for (const name of MANAGED_API_KEYS) {
+    const v = getApiKey(name);
+    keys[name] = { configured: v !== '', masked: maskKey(v) };
+  }
+  res.json({ success: true, keys });
+});
+
+// -------------------------------------------------------------
+// API ROUTE: POST /api/settings/keys
+// Body: { TRIPO_API_KEY?: string, AGNES_API_KEY?: string, ... }
+// Empty string clears a stored key (falls back to env). Persisted to
+// data/keys.json (gitignored, 0600). Never logs values.
+// -------------------------------------------------------------
+app.post('/api/settings/keys', (req: Request, res: Response) => {
+  try {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const stored = readKeysFile();
+    const updated: string[] = [];
+    for (const name of MANAGED_API_KEYS) {
+      if (!(name in body)) continue;
+      const v = typeof body[name] === 'string' ? (body[name] as string).trim() : '';
+      if (v === '') {
+        delete stored[name];
+        runtimeKeyOverrides.delete(name);
+      } else {
+        stored[name] = v;
+        runtimeKeyOverrides.set(name, v);
+      }
+      updated.push(name);
+    }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(KEYS_FILE, JSON.stringify(stored, null, 2), { mode: 0o600 });
+    const keys: Record<string, { configured: boolean; masked: string }> = {};
+    for (const name of MANAGED_API_KEYS) {
+      const v = getApiKey(name);
+      keys[name] = { configured: v !== '', masked: maskKey(v) };
+    }
+    res.json({ success: true, updated, keys });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Failed to save keys' });
+  }
+});
+
+// -------------------------------------------------------------
+// API ROUTE: POST /api/upload-glb
+// Accepts a raw .glb binary body (Content-Type: model/gltf-binary),
+// stores it under data/uploads, and returns a local URL the viewer
+// and minting flow can use. 50MB cap. GLB magic bytes validated.
+// -------------------------------------------------------------
+app.post(
+  '/api/upload-glb',
+  express.raw({ type: 'model/gltf-binary', limit: '50mb' }),
+  (req: Request, res: Response) => {
+    try {
+      const buf = req.body as Buffer;
+      if (!buf || !Buffer.isBuffer(buf) || buf.length < 12) {
+        return res.status(400).json({ success: false, error: 'No GLB data received' });
+      }
+      if (buf.readUInt32LE(0) !== 0x46546c67) {
+        return res.status(400).json({ success: false, error: 'Not a valid GLB file (bad magic bytes)' });
+      }
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+      const filename = `${id}.glb`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), buf);
+      const url = `/api/uploads/${filename}`;
+      console.log(`[Upload] GLB stored: ${filename} (${(buf.length / 1024 / 1024).toFixed(2)} MB)`);
+      res.json({ success: true, url, filename, sizeBytes: buf.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message || 'Upload failed' });
+    }
+  }
+);
+
+// Serve uploaded GLBs
+app.get('/api/uploads/:filename', (req: Request, res: Response) => {
+  const filename = path.basename(req.params.filename || '');
+  if (!/^[-a-z0-9]+\.glb$/i.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+  const full = path.join(UPLOADS_DIR, filename);
+  if (!fs.existsSync(full)) {
+    return res.status(404).json({ error: 'Upload not found' });
+  }
+  res.setHeader('Content-Type', 'model/gltf-binary');
+  res.sendFile(full);
+});
+
 /**
  * Procedural binary GLTF/GLB builder for server-side 3D asset serving
  */
@@ -449,8 +787,8 @@ app.post('/api/pin-metadata', async (req: Request, res: Response) => {
     const finalModelUrl = animation_url || modelUrl || 'ipfs://bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xednzrqoj3dwfe8528956/model.glb';
 
     const pinataJwt = process.env.PINATA_JWT;
-    const pinataApiKey = process.env.PINATA_API_KEY;
-    const pinataSecretKey = process.env.PINATA_SECRET_API_KEY;
+    const pinataApiKey = getApiKey('PINATA_API_KEY');
+    const pinataSecretKey = getApiKey('PINATA_SECRET_API_KEY');
     const pinataGateway = process.env.PINATA_GATEWAY || 'gateway.pinata.cloud';
 
     // Build standard ERC-721 compliant metadata object
@@ -577,7 +915,7 @@ app.post('/api/generate-music', async (req: Request, res: Response) => {
   try {
     const { prompt = 'ambient sci-fi cyberpunk synthwave', duration = 15, style = 'cyberpunk' } = req.body;
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = getApiKey('GEMINI_API_KEY');
     let geminiDescription = '';
 
     if (apiKey) {

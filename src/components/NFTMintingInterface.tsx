@@ -21,7 +21,8 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import {
-  CONTRACT_ADDRESSES,
+  getContractAddress,
+  isV2Deployed,
   GENERATIVE_3D_NFT_ABI,
   SUPPORTED_CHAINS,
 } from '../contracts/contractConfig';
@@ -48,7 +49,8 @@ export const NFTMintingInterface: React.FC<NFTMintingInterfaceProps> = ({
 
   // Active Contract Address based on current network (default to Polygon Amoy Testnet)
   const activeChainId = chainId === 137 ? 137 : 80002;
-  const contractAddress = CONTRACT_ADDRESSES[activeChainId];
+  const contractAddress = getContractAddress(activeChainId);
+  const isV2 = isV2Deployed(activeChainId);
   const activeChain = SUPPORTED_CHAINS.find((c) => c.id === activeChainId) || SUPPORTED_CHAINS[1];
 
   // User Inputs
@@ -204,7 +206,10 @@ export const NFTMintingInterface: React.FC<NFTMintingInterfaceProps> = ({
               3D NFT Minting Terminal
             </h3>
             <p className="text-[11px] text-neutral-400">
-              ERC-721 Smart Contract • {activeChain.name}
+              ERC-721 Smart Contract • {activeChain.name} •{' '}
+              <span className={isV2 ? 'text-emerald-400 font-semibold' : 'text-amber-400'}>
+                {isV2 ? 'V2 updatable' : 'V1 legacy'}
+              </span>
             </p>
           </div>
         </div>
