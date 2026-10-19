@@ -7,6 +7,26 @@ export const CONTRACT_ADDRESSES: Record<number, `0x${string}`> = {
   80002: '0x43De684bB6165F17eAb637A1792B215E0F7d0D54',
 };
 
+/**
+ * Generative3DNFTv2 (updatable + per-token file registry) deployment addresses.
+ * Fill these in after deploying contracts/Generative3DNFTv2.sol (see contracts/DEPLOY.md).
+ * Until set, the app keeps minting against the V1 addresses above.
+ */
+export const CONTRACT_ADDRESSES_V2: Record<number, `0x${string}`> = {
+  // 137: '0x...',   // Polygon Mainnet V2
+  // 80002: '0x...', // Polygon Amoy V2
+};
+
+/** Returns the V2 address for a chain when deployed, otherwise falls back to V1. */
+export function getContractAddress(chainId: number): `0x${string}` {
+  return CONTRACT_ADDRESSES_V2[chainId] ?? CONTRACT_ADDRESSES[chainId];
+}
+
+/** True when the updatable V2 contract is deployed on this chain. */
+export function isV2Deployed(chainId: number): boolean {
+  return Boolean(CONTRACT_ADDRESSES_V2[chainId]);
+}
+
 export const DEFAULT_CHAIN_ID = 80002; // Default to Polygon Amoy Testnet for risk-free testing
 
 export const GENERATIVE_3D_NFT_ABI = parseAbi([
@@ -25,7 +45,16 @@ export const GENERATIVE_3D_NFT_ABI = parseAbi([
   'function balanceOf(address owner) external view returns (uint256)',
   'function ownerOf(uint256 tokenId) external view returns (address)',
   'function symbol() external view returns (string)',
-  'function name() external view returns (string)'
+  'function name() external view returns (string)',
+  // --- Generative3DNFTv2: updatable metadata + per-token file registry ---
+  'event TokenURIUpdated(uint256 indexed tokenId, string oldURI, string newURI)',
+  'event TokenFileAdded(uint256 indexed tokenId, uint256 fileIndex, string uri, string fileType, string name)',
+  'event TokenFileRemoved(uint256 indexed tokenId, uint256 fileIndex)',
+  'function updateTokenURI(uint256 tokenId, string newURI) external',
+  'function addTokenFile(uint256 tokenId, string uri, string fileType, string name) external returns (uint256)',
+  'function removeTokenFile(uint256 tokenId, uint256 fileIndex) external',
+  'function getTokenFiles(uint256 tokenId) external view returns ((string uri, string fileType, string name)[])',
+  'function tokenFileCount(uint256 tokenId) external view returns (uint256)'
 ] as const);
 
 export const SUPPORTED_CHAINS = [

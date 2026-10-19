@@ -27,6 +27,92 @@ function generateDeterministicCID(content: string): string {
 }
 
 // -------------------------------------------------------------
+// Meshy AI Text-to-3D integration (real AI generation)
+// Verified against the official OpenAPI spec (https://docs.meshy.ai/openapi.yaml):
+//   Base URL: https://api.meshy.ai/openapi
+//   Auth: Authorization: Bearer <redacted>  (key from https://www.meshy.ai/settings/api, form msy_*)
+//   Submit: POST /v2/text-to-3d {mode:'preview'|'refine', prompt, ...} -> 202 {"result":"<taskId>"}
+//   Poll:   GET  /v2/text-to-3d/{id} -> {status: PENDING|IN_PROGRESS|SUCCEEDED|FAILED|CANCELED,
+//                                        progress, model_urls: {glb, ...}, thumbnail_url, task_error}
+// Free tier: 100 credits/mo, no card. Enable with MESHY_API_KEY env var.
+// -------------------------------------------------------------
+const MESHY_API_BASE = 'https://api.meshy.ai/openapi';
+const MESHY_REQUEST_TIMEOUT_MS = 30000;
+
+interface MeshyJob {
+  meshyTaskId: string;
+  phase: 'preview' | 'refine';
+  prompt: string;
+  seed: number;
+  stylePreset: string;
+  createdAt: number;
+}
+// In-memory job registry (single instance; entries expire after 2h)
+const meshyJobs = new Map<string, MeshyJob>();
+
+function makeLocalTaskId(): string {
+  return `meshy-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
+async function meshyFetch(path: string, init: RequestInit, apiKey: string): Promise<globalThis.Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), MESHY_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(`${MESHY_API_BASE}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function submitMeshyPreview(
+  prompt: string,
+  seed: number,
+  stylePreset: string,
+  apiKey: string
+): Promise<string | null> {
+  const enrichedPrompt = `${prompt}, ${stylePreset} style 3D game asset, centered composition`.slice(0, 800);
+  const res = await meshyFetch(
+    '/v2/text-to-3d',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'preview',
+        prompt: enrichedPrompt,
+        negative_prompt: 'low quality, blurry, watermark, text, logo',
+        art_style: 'realistic',
+        ai_model: 'latest',
+        seed,
+        target_polycount: 30000,
+        topology: 'triangle',
+        moderation: true,
+      }),
+    },
+    apiKey
+  );
+  if (res.status !== 202) {
+    const body = await res.text().catch(() => '');
+    console.warn(`[Meshy] Preview submit failed [HTTP ${res.status}]:`, body.slice(0, 500));
+    return null;
+  }
+  const data: any = await res.json().catch(() => null);
+  return data?.result || null;
+}
+
+async function getMeshyTask(taskId: string, apiKey: string): Promise<any | null> {
+  const res = await meshyFetch(`/v2/text-to-3d/${encodeURIComponent(taskId)}`, { method: 'GET' }, apiKey);
+  if (!res.ok) return null;
+  return res.json().catch(() => null);
+}
+
+// -------------------------------------------------------------
 // API ROUTE: /api/generate-3d
 // Agnes AI 3D Gateway with Procedural Engine Fallback
 // -------------------------------------------------------------
@@ -56,6 +142,47 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
     const validatedStylePreset: AllowedStylePreset = ALLOWED_STYLE_PRESETS.includes(rawPreset as any)
       ? (rawPreset as AllowedStylePreset)
       : 'cyberpunk';
+
+    // 2b. Meshy AI Text-to-3D (REAL AI generation) — attempted before any fallback.
+    // Submits an async job and returns immediately; the client polls
+    // GET /api/generate-3d/status?taskId=... until the GLB is ready.
+    const meshyApiKey = process.env.MESHY_API_KEY;
+    if (meshyApiKey && meshyApiKey.trim() !== '') {
+      try {
+        console.log(`[Meshy] Submitting text-to-3D task for prompt: "${prompt}" [seed: ${validatedSeed}]`);
+        const meshyTaskId = await submitMeshyPreview(
+          prompt,
+          validatedSeed,
+          validatedStylePreset,
+          meshyApiKey.trim()
+        );
+        if (meshyTaskId) {
+          const localTaskId = makeLocalTaskId();
+          meshyJobs.set(localTaskId, {
+            meshyTaskId,
+            phase: 'preview',
+            prompt,
+            seed: validatedSeed,
+            stylePreset: validatedStylePreset,
+            createdAt: Date.now(),
+          });
+          return res.json({
+            success: true,
+            provider: 'meshy',
+            taskId: localTaskId,
+            status: 'processing',
+            phase: 'preview',
+            progress: 0,
+            prompt,
+            stylePreset: validatedStylePreset,
+            seed: validatedSeed,
+          });
+        }
+        console.warn('[Meshy] Submit failed, falling back to procedural pipeline.');
+      } catch (meshyErr: any) {
+        console.warn('[Meshy] Submit exception, falling back to procedural pipeline:', meshyErr.message);
+      }
+    }
 
     const agnesApiKey = process.env.AGNES_API_KEY;
     let agnesDiagnostic: {
@@ -325,6 +452,104 @@ app.post('/api/generate-3d', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error generating 3D model:', error);
     return res.status(500).json({ error: error.message || 'Failed to generate 3D model' });
+  }
+});
+
+// -------------------------------------------------------------
+// API ROUTE: GET /api/generate-3d/status?taskId=...
+// Polls a Meshy text-to-3D job through preview -> refine (texture)
+// and returns the finished GLB URL when ready.
+// -------------------------------------------------------------
+app.get('/api/generate-3d/status', async (req: Request, res: Response) => {
+  try {
+    const taskId = (req.query.taskId || '').toString();
+
+    // Prune jobs older than 2h
+    const now = Date.now();
+    for (const [k, v] of meshyJobs) {
+      if (now - v.createdAt > 2 * 60 * 60 * 1000) meshyJobs.delete(k);
+    }
+
+    const job = meshyJobs.get(taskId);
+    if (!job) {
+      return res.status(404).json({ status: 'failed', error: 'Unknown or expired generation task' });
+    }
+
+    const meshyApiKey = (process.env.MESHY_API_KEY || '').trim();
+    if (!meshyApiKey) {
+      return res.status(500).json({ status: 'failed', error: 'MESHY_API_KEY is not configured' });
+    }
+
+    const task = await getMeshyTask(job.meshyTaskId, meshyApiKey);
+    if (!task) {
+      return res.json({ status: 'processing', phase: job.phase, progress: 0, taskId });
+    }
+
+    const status = task.status as string;
+    const progress = typeof task.progress === 'number' ? task.progress : 0;
+
+    if (status === 'SUCCEEDED') {
+      if (job.phase === 'preview') {
+        // Chain the refine phase so the model comes back with PBR textures
+        try {
+          const refineRes = await meshyFetch(
+            '/v2/text-to-3d',
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                mode: 'refine',
+                preview_task_id: job.meshyTaskId,
+                texture_prompt: `${job.prompt}, ${job.stylePreset} style, PBR game asset textures`,
+              }),
+            },
+            meshyApiKey
+          );
+          if (refineRes.status === 202) {
+            const refineData: any = await refineRes.json().catch(() => null);
+            if (refineData?.result) {
+              job.meshyTaskId = refineData.result;
+              job.phase = 'refine';
+              console.log(`[Meshy] Preview SUCCEEDED, refine task submitted: ${refineData.result}`);
+              return res.json({ status: 'processing', phase: 'refine', progress: 55, taskId });
+            }
+          }
+          console.warn('[Meshy] Refine submit failed — returning untextured preview GLB.');
+        } catch (e: any) {
+          console.warn('[Meshy] Refine submit exception — returning untextured preview GLB:', e.message);
+        }
+      }
+
+      const glbUrl = task.model_urls?.glb || null;
+      if (!glbUrl) {
+        return res.status(502).json({ status: 'failed', error: 'Meshy task succeeded but returned no GLB URL' });
+      }
+      meshyJobs.delete(taskId);
+      return res.json({
+        status: 'completed',
+        provider: 'meshy',
+        taskId,
+        modelUrl: glbUrl,
+        thumbnailUrl: task.thumbnail_url || null,
+        progress: 100,
+        prompt: job.prompt,
+        stylePreset: job.stylePreset,
+        seed: job.seed,
+        textured: job.phase === 'refine',
+        creditsUsed: task.consumed_credits ?? null,
+      });
+    }
+
+    if (status === 'FAILED' || status === 'CANCELED') {
+      meshyJobs.delete(taskId);
+      const msg = task.task_error?.message || `Meshy task ${status.toLowerCase()}`;
+      console.warn('[Meshy] Task failed:', msg);
+      return res.json({ status: 'failed', taskId, error: msg });
+    }
+
+    return res.json({ status: 'processing', phase: job.phase, progress, taskId });
+  } catch (err: any) {
+    console.error('[Meshy] Status poll error:', err.message);
+    return res.status(500).json({ status: 'failed', error: err.message || 'Status poll failed' });
   }
 });
 

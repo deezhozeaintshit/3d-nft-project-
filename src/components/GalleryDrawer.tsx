@@ -1,5 +1,6 @@
-import React from 'react';
-import { X, ExternalLink, Play, Eye, Sparkles, Box, HardDrive } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, ExternalLink, Play, Eye, Sparkles, Box, HardDrive, Settings2 } from 'lucide-react';
+import { NFTManager } from './NFTManager';
 
 export interface MintedNFTItem {
   tokenId: number;
@@ -33,6 +34,26 @@ export const GalleryDrawer: React.FC<GalleryDrawerProps> = ({
   onPlayAudio,
 }) => {
   if (!isOpen) return null;
+
+  return (
+    <GalleryDrawerInner
+      isOpen={isOpen}
+      onClose={onClose}
+      items={items}
+      onLoadIntoScene={onLoadIntoScene}
+      onPlayAudio={onPlayAudio}
+    />
+  );
+};
+
+const GalleryDrawerInner: React.FC<GalleryDrawerProps> = ({
+  isOpen,
+  onClose,
+  items,
+  onLoadIntoScene,
+  onPlayAudio,
+}) => {
+  const [managingTokenId, setManagingTokenId] = useState<number | null>(null);
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-black/60 backdrop-blur-xs select-none">
@@ -144,6 +165,15 @@ export const GalleryDrawer: React.FC<GalleryDrawerProps> = ({
                         <span>Sound</span>
                       </button>
                     )}
+
+                    <button
+                      onClick={() => setManagingTokenId(item.tokenId)}
+                      className="flex items-center space-x-1 px-2 py-1 rounded-md text-[11px] font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-300 transition-colors"
+                      title="Update metadata URI or attach additional files (V2 contract)"
+                    >
+                      <Settings2 className="w-3 h-3 text-amber-400" />
+                      <span>Manage</span>
+                    </button>
                   </div>
 
                   <a
@@ -161,6 +191,10 @@ export const GalleryDrawer: React.FC<GalleryDrawerProps> = ({
           )}
         </div>
       </div>
+
+      {managingTokenId !== null && (
+        <NFTManager tokenId={managingTokenId} onClose={() => setManagingTokenId(null)} />
+      )}
     </div>
   );
 };

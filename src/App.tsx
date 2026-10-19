@@ -238,6 +238,139 @@ export default function App() {
     }
   };
 
+  // Poll a Meshy text-to-3D job until the GLB is ready (returns true) or it fails (false)
+  const pollMeshyGeneration = async (taskId: string, candidateSeed: number): Promise<boolean> => {
+    const startedAt = Date.now();
+    const MAX_WAIT_MS = 10 * 60 * 1000; // 10 minutes max
+    setToastMessage('Meshy AI is sculpting your model... (0%)');
+    while (Date.now() - startedAt < MAX_WAIT_MS) {
+      await new Promise((r) => setTimeout(r, 5000));
+      let s: any = null;
+      try {
+        const resp = await fetch(`/api/generate-3d/status?taskId=${encodeURIComponent(taskId)}`);
+        s = await resp.json();
+      } catch (e: any) {
+        console.warn('[Meshy] status poll network error:', e.message);
+        continue;
+      }
+      if (!s) continue;
+      if (s.status === 'completed' && s.modelUrl) {
+        setR3fModelUrl(s.modelUrl);
+        setSeed(typeof s.seed === 'number' ? s.seed : candidateSeed);
+        if (s.thumbnailUrl) setPreviewImage(s.thumbnailUrl);
+        const quality = s.textured ? 'textured' : 'preview';
+        setNftName(`${(s.stylePreset || stylePreset).toUpperCase()} AI Artifact #${(candidateSeed % 900) + 100}`);
+        setDescription(`AI-generated 3D model synthesized from prompt: "${prompt}" (Meshy AI, ${quality} quality)`);
+        setPolyCount(30000);
+        setToastMessage(`Meshy AI model ready — ${quality} GLB loaded`);
+        setTimeout(() => setToastMessage(null), 4000);
+        return true;
+      }
+      if (s.status === 'failed') {
+        console.warn('[Meshy] generation failed:', s.error);
+        return false;
+      }
+      const pct = typeof s.progress === 'number' ? s.progress : 0;
+      const phase = s.phase === 'refine' ? 'texturing' : 'sculpting';
+      setToastMessage(`Meshy AI is ${phase} your model... (${pct}%)`);
+    }
+    console.warn('[Meshy] poll timed out after 10 minutes');
+    return false;
+  };
+
+  // Client-side procedural fallback (used when the backend is unreachable or Meshy fails)
+  const runClientProceduralFallback = (candidateSeed: number) => {
+    // High-grade client-side procedural fallback
+    console.log('[3D Generation] Synthesizing procedural 3D model client-side for seed:', candidateSeed);
+    setSeed(candidateSeed);
+    setR3fModelUrl('');
+
+    // Derive dynamic archetype from prompt
+    const lp = prompt.toLowerCase();
+    let fallbackName = `Cyber Sentinel #${(candidateSeed % 900) + 100}`;
+    let fallbackPoly = 18400 + (candidateSeed % 12000);
+    let fallbackDesc = `Enterprise 3D Generative NFT artifact. Synthesized from prompt: "${prompt}"`;
+
+    if (lp.includes('dragon') || lp.includes('beast') || lp.includes('creature') || lp.includes('wing')) {
+      fallbackName = `Aetherian Mecha Wyrm #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 28600 + (candidateSeed % 8000);
+      fallbackDesc = `Legendary bio-mechanical wyrm with articulated crystalline wings and plasma core.`;
+      setMaterialsConfig({
+        primaryColor: '#dc2626',
+        secondaryColor: '#f59e0b',
+        accentColor: '#ef4444',
+        roughness: 0.18,
+        metalness: 0.92,
+        emissiveIntensity: 3.8,
+      });
+    } else if (lp.includes('portal') || lp.includes('stargate') || lp.includes('ring') || lp.includes('warp')) {
+      fallbackName = `Chronos Warp Stargate #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 24200 + (candidateSeed % 9000);
+      fallbackDesc = `Interdimensional ring gate with counter-rotating quantum stabilizers.`;
+      setMaterialsConfig({
+        primaryColor: '#2563eb',
+        secondaryColor: '#8b5cf6',
+        accentColor: '#06b6d4',
+        roughness: 0.14,
+        metalness: 0.96,
+        emissiveIntensity: 3.5,
+      });
+    } else if (lp.includes('reactor') || lp.includes('tokamak') || lp.includes('engine') || lp.includes('core')) {
+      fallbackName = `Tokamak Singularity Core #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 21500 + (candidateSeed % 7000);
+      fallbackDesc = `Magnetic containment singularity reactor generating localized plasma harmonics.`;
+      setMaterialsConfig({
+        primaryColor: '#059669',
+        secondaryColor: '#0284c7',
+        accentColor: '#10b981',
+        roughness: 0.28,
+        metalness: 0.86,
+        emissiveIntensity: 3.2,
+      });
+    } else if (lp.includes('monolith') || lp.includes('crystal') || stylePreset === 'celestial') {
+      fallbackName = `Celestial Quantum Monolith #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 25000 + (candidateSeed % 6000);
+      fallbackDesc = `Hyper-specular celestial spire etched with harmonic resonant frequencies.`;
+      setMaterialsConfig({
+        primaryColor: '#e0e7ff',
+        secondaryColor: '#38bdf8',
+        accentColor: '#f59e0b',
+        roughness: 0.12,
+        metalness: 0.98,
+        emissiveIntensity: 3.6,
+      });
+    } else if (stylePreset === 'biotech') {
+      fallbackName = `Biomechanical Neural Core #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 19200 + (candidateSeed % 5000);
+      fallbackDesc = `Biomechanical neural chamber with translucent cryo shell and synaptic core.`;
+      setMaterialsConfig({
+        primaryColor: '#10b981',
+        secondaryColor: '#14b8a6',
+        accentColor: '#a855f7',
+        roughness: 0.35,
+        metalness: 0.75,
+        emissiveIntensity: 2.2,
+      });
+    } else if (stylePreset === 'obsidian') {
+      fallbackName = `Obsidian Void Relic #${(candidateSeed % 900) + 100}`;
+      fallbackPoly = 27800 + (candidateSeed % 7000);
+      fallbackDesc = `Deep space void artifact forged from crystalline dark matter.`;
+      setMaterialsConfig({
+        primaryColor: '#1e1b4b',
+        secondaryColor: '#475569',
+        accentColor: '#6366f1',
+        roughness: 0.08,
+        metalness: 0.98,
+        emissiveIntensity: 3.0,
+      });
+    }
+
+    setNftName(fallbackName);
+    setPolyCount(fallbackPoly);
+    setDescription(fallbackDesc);
+    setToastMessage(`✨ Synthesized: ${fallbackName} (${fallbackPoly.toLocaleString()} Polys)`);
+    setTimeout(() => setToastMessage(null), 4000);
+  };
   // 1. Generate 3D Artifact via API
   const handleGenerate3D = async () => {
     setIsGenerating(true);
@@ -276,6 +409,15 @@ export default function App() {
 
       // If backend data was returned successfully, apply verified backend specs
       if (data && data.success) {
+        // --- Real AI path: Meshy async text-to-3D job, poll until the GLB is ready ---
+        if (data.provider === 'meshy' && data.taskId && data.status === 'processing') {
+          const meshyOk = await pollMeshyGeneration(data.taskId, candidateSeed);
+          if (!meshyOk) {
+            setToastMessage('Meshy AI generation failed — procedural fallback engaged');
+            setTimeout(() => setToastMessage(null), 3500);
+            runClientProceduralFallback(candidateSeed);
+          }
+        } else {
         // Backend seed verification
         if (typeof data.seed === 'number' && Number.isFinite(data.seed) && data.seed >= 0) {
           setSeed(data.seed);
@@ -315,97 +457,10 @@ export default function App() {
           setToastMessage(`✨ Synthesized: ${generatedName} (${count.toLocaleString()} Polys)`);
           setTimeout(() => setToastMessage(null), 4000);
         }
+        } // end non-Meshy backend path
       } else {
         // High-grade client-side procedural fallback
-        console.log('[3D Generation] Synthesizing procedural 3D model client-side for seed:', candidateSeed);
-        setSeed(candidateSeed);
-        setR3fModelUrl('');
-
-        // Derive dynamic archetype from prompt
-        const lp = prompt.toLowerCase();
-        let fallbackName = `Cyber Sentinel #${(candidateSeed % 900) + 100}`;
-        let fallbackPoly = 18400 + (candidateSeed % 12000);
-        let fallbackDesc = `Enterprise 3D Generative NFT artifact. Synthesized from prompt: "${prompt}"`;
-
-        if (lp.includes('dragon') || lp.includes('beast') || lp.includes('creature') || lp.includes('wing')) {
-          fallbackName = `Aetherian Mecha Wyrm #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 28600 + (candidateSeed % 8000);
-          fallbackDesc = `Legendary bio-mechanical wyrm with articulated crystalline wings and plasma core.`;
-          setMaterialsConfig({
-            primaryColor: '#dc2626',
-            secondaryColor: '#f59e0b',
-            accentColor: '#ef4444',
-            roughness: 0.18,
-            metalness: 0.92,
-            emissiveIntensity: 3.8,
-          });
-        } else if (lp.includes('portal') || lp.includes('stargate') || lp.includes('ring') || lp.includes('warp')) {
-          fallbackName = `Chronos Warp Stargate #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 24200 + (candidateSeed % 9000);
-          fallbackDesc = `Interdimensional ring gate with counter-rotating quantum stabilizers.`;
-          setMaterialsConfig({
-            primaryColor: '#2563eb',
-            secondaryColor: '#8b5cf6',
-            accentColor: '#06b6d4',
-            roughness: 0.14,
-            metalness: 0.96,
-            emissiveIntensity: 3.5,
-          });
-        } else if (lp.includes('reactor') || lp.includes('tokamak') || lp.includes('engine') || lp.includes('core')) {
-          fallbackName = `Tokamak Singularity Core #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 21500 + (candidateSeed % 7000);
-          fallbackDesc = `Magnetic containment singularity reactor generating localized plasma harmonics.`;
-          setMaterialsConfig({
-            primaryColor: '#059669',
-            secondaryColor: '#0284c7',
-            accentColor: '#10b981',
-            roughness: 0.28,
-            metalness: 0.86,
-            emissiveIntensity: 3.2,
-          });
-        } else if (lp.includes('monolith') || lp.includes('crystal') || stylePreset === 'celestial') {
-          fallbackName = `Celestial Quantum Monolith #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 25000 + (candidateSeed % 6000);
-          fallbackDesc = `Hyper-specular celestial spire etched with harmonic resonant frequencies.`;
-          setMaterialsConfig({
-            primaryColor: '#e0e7ff',
-            secondaryColor: '#38bdf8',
-            accentColor: '#f59e0b',
-            roughness: 0.12,
-            metalness: 0.98,
-            emissiveIntensity: 3.6,
-          });
-        } else if (stylePreset === 'biotech') {
-          fallbackName = `Biomechanical Neural Core #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 19200 + (candidateSeed % 5000);
-          fallbackDesc = `Biomechanical neural chamber with translucent cryo shell and synaptic core.`;
-          setMaterialsConfig({
-            primaryColor: '#10b981',
-            secondaryColor: '#14b8a6',
-            accentColor: '#a855f7',
-            roughness: 0.35,
-            metalness: 0.75,
-            emissiveIntensity: 2.2,
-          });
-        } else if (stylePreset === 'obsidian') {
-          fallbackName = `Obsidian Void Relic #${(candidateSeed % 900) + 100}`;
-          fallbackPoly = 27800 + (candidateSeed % 7000);
-          fallbackDesc = `Deep space void artifact forged from crystalline dark matter.`;
-          setMaterialsConfig({
-            primaryColor: '#1e1b4b',
-            secondaryColor: '#475569',
-            accentColor: '#6366f1',
-            roughness: 0.08,
-            metalness: 0.98,
-            emissiveIntensity: 3.0,
-          });
-        }
-
-        setNftName(fallbackName);
-        setPolyCount(fallbackPoly);
-        setDescription(fallbackDesc);
-        setToastMessage(`✨ Synthesized: ${fallbackName} (${fallbackPoly.toLocaleString()} Polys)`);
-        setTimeout(() => setToastMessage(null), 4000);
+        runClientProceduralFallback(candidateSeed);
       }
 
       // Frame and focus the new 3D model
