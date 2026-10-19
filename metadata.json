@@ -1,0 +1,6 @@
+{
+  "name": "PolyDimension - Generative 3D NFT Studio",
+  "description": "Enterprise-grade 3D NFT generation, procedural synthesis, IPFS decentralized pinning, and Polygon minting dApp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
