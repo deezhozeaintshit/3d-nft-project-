@@ -13,7 +13,7 @@ export const CONTRACT_ADDRESSES: Record<number, `0x${string}`> = {
  * Until set, the app keeps minting against the V1 addresses above.
  */
 export const CONTRACT_ADDRESSES_V2: Record<number, `0x${string}`> = {
-  // 137: '0x...',   // Polygon Mainnet V2
+  137: '0x7c973cf8361e45A3Fe1d2aF1C948d6986282FC37', // Polygon Mainnet V2 (deployed 2026-10-19)
   // 80002: '0x...', // Polygon Amoy V2
 };
 
